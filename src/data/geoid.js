@@ -1,42 +1,117 @@
-// src/data/geoid.js — bundled EGM96 geoid-undulation lookup.
+// src/data/geoid.js � bundled EGM96 geoid-undulation lookup using static binary grid.
 //
 // h = H + N: the globe (Cesium ellipsoid) needs ELLIPSOIDAL height (h);
 // most real-world elevation sources (barometric altitude, MSL survey data,
 // Caltrans/TfL camera priors) give ORTHOMETRIC height (H, "height above mean
-// sea level"). N is the local geoid undulation — the gap between the WGS84
+// sea level"). N is the local geoid undulation � the gap between the WGS84
 // ellipsoid and the geoid (~mean sea level) surface, ranging roughly
 // -106..+85 m worldwide. See docs/plans/2026-07-05-entity-height-datum-fix.md.
 //
-// Decision rule (task brief): try `egm96-universal` (npm, MIT, embeds the NGA
-// EGM96 15' grid) as a lazy dynamic import so its ~2.7 MB grid data-chunk
-// never lands in the eager Vite bundle. Only fall back to vendoring the NGA
-// grid ourselves if the package fails tests, isn't browser-safe, or bloats
-// the eager bundle. `egm96-universal` passed all three checks (see the
-// task report), so this file is a thin wrapper around it — no vendored
-// fallback was needed.
-//
-// egm96-universal's `meanSeaLevel(lat, lon)` already returns exactly N in
-// metres (relative to WGS84 ellipsoid) with internal longitude
-// normalization (wraps to [-180, 180) before the grid lookup), so no extra
-// wrap/interpolation logic is needed here.
+// ATTRIBUTION & LICENSING:
+// - EGM96 Geoid Model data produced by the National Geospatial-Intelligence Agency (NGA) / NASA.
+// - Bilinear interpolation algorithm derivative of `egm96-universal` (MIT License, Copyright (c) 2020 Nicolas Vanhoren).
+// - Binary dataset stored in public/egm96.bin (2,076,480 bytes) as 15-minute grid Int16 (cm).
 
-let egm96Module = null;
+const INTERVAL = (15 / 60) * (Math.PI / 180); // 15 arcminutes in radians
+const NUM_ROWS = 721;
+const NUM_COLS = 1440;
+
+let dataView = null;
 let readyPromise = null;
 
+function degreesToRadians(degrees) {
+  return degrees * (Math.PI / 180);
+}
+
+function normalizeRadians(rads, center = 0) {
+  return rads - (2 * Math.PI) * Math.floor((rads + Math.PI - center) / (2 * Math.PI));
+}
+
+function linearInterpolation(a, b, prop) {
+  return a + (b - a) * prop;
+}
+
+function bilinearInterpolation(topLeft, bottomLeft, bottomRight, topRight, x, y) {
+  const top = linearInterpolation(topLeft, topRight, x);
+  const bottom = linearInterpolation(bottomLeft, bottomRight, x);
+  return linearInterpolation(top, bottom, y);
+}
+
 /**
- * Lazily loads the EGM96 grid (dynamic import — code-split by Vite so the
- * ~2.7 MB grid data stays out of the eager main bundle). Safe to call many
- * times; the underlying import only happens once and subsequent calls
- * resolve immediately from the cached promise.
+ * Lazily loads the EGM96 grid binary asset (public/egm96.bin) on demand.
+ * Safe to call repeatedly; subsequent calls return the cached promise.
  * @returns {Promise<void>}
  */
 export async function ensureGeoidReady() {
   if (!readyPromise) {
-    readyPromise = import('egm96-universal').then((mod) => {
-      egm96Module = mod;
-    });
+    readyPromise = (async () => {
+      let buffer;
+      if (typeof process !== 'undefined' && process.versions && process.versions.node && typeof window === 'undefined') {
+        // Node.js runtime (unit tests)
+        const fs = await import('node:fs/promises');
+        const path = await import('node:path');
+        const url = await import('node:url');
+        let binPath;
+        try {
+          const __dirname = path.dirname(url.fileURLToPath(import.meta.url));
+          binPath = path.resolve(__dirname, '../../public/egm96.bin');
+        } catch {
+          binPath = path.resolve(process.cwd(), 'public/egm96.bin');
+        }
+        const fileBuf = await fs.readFile(binPath);
+        buffer = fileBuf.buffer.slice(fileBuf.byteOffset, fileBuf.byteOffset + fileBuf.byteLength);
+      } else {
+        // Browser runtime (Vite web app)
+        const response = await fetch('/egm96.bin');
+        if (!response.ok) {
+          throw new Error(`Failed to load EGM96 geoid data asset: ${response.status} ${response.statusText}`);
+        }
+        buffer = await response.arrayBuffer();
+      }
+      dataView = new DataView(buffer);
+    })();
   }
   return readyPromise;
+}
+
+/**
+ * Raw EGM96 mean sea level lookup function.
+ * @param {number} latitude
+ * @param {number} longitude
+ * @returns {number}
+ */
+export function meanSeaLevel(latitude, longitude) {
+  if (!dataView) {
+    throw new Error(
+      'geoid.js: geoidHeight() called before ensureGeoidReady() resolved � ' +
+        'await ensureGeoidReady() first.',
+    );
+  }
+  const lat = normalizeRadians(degreesToRadians(latitude));
+  if (lat > Math.PI || lat < -Math.PI) {
+    throw new Error('Invalid latitude');
+  }
+  const lon = normalizeRadians(degreesToRadians(longitude));
+
+  let topRow = Math.floor(((Math.PI / 2) - lat) / INTERVAL);
+  topRow = topRow === NUM_ROWS - 1 ? topRow - 1 : topRow;
+  const bottomRow = topRow + 1;
+
+  const leftCol = Math.floor(normalizeRadians(lon, Math.PI) / INTERVAL);
+  const rightCol = (leftCol + 1) % NUM_COLS;
+
+  const topLeft = dataView.getInt16((topRow * NUM_COLS + leftCol) * 2, false) / 100;
+  const bottomLeft = dataView.getInt16((bottomRow * NUM_COLS + leftCol) * 2, false) / 100;
+  const bottomRight = dataView.getInt16((bottomRow * NUM_COLS + rightCol) * 2, false) / 100;
+  const topRight = dataView.getInt16((topRow * NUM_COLS + rightCol) * 2, false) / 100;
+
+  const lonLeft = normalizeRadians(leftCol * INTERVAL);
+  const latTop = (Math.PI / 2) - (topRow * INTERVAL);
+
+  const leftProp = (lon - lonLeft) / INTERVAL;
+  const topProp = (latTop - lat) / INTERVAL;
+
+  return bilinearInterpolation(topLeft, bottomLeft, bottomRight, topRight, leftProp, topProp);
 }
 
 /**
@@ -48,13 +123,7 @@ export async function ensureGeoidReady() {
  * @returns {number}
  */
 export function geoidHeight(latDeg, lonDeg) {
-  if (!egm96Module) {
-    throw new Error(
-      'geoid.js: geoidHeight() called before ensureGeoidReady() resolved — ' +
-        'await ensureGeoidReady() first.',
-    );
-  }
-  return egm96Module.meanSeaLevel(latDeg, lonDeg);
+  return meanSeaLevel(latDeg, lonDeg);
 }
 
 /**
@@ -72,22 +141,6 @@ export function orthometricToEllipsoidal(hMslM, latDeg, lonDeg) {
 /**
  * READOUT-ONLY inverse of {@link orthometricToEllipsoidal}: H = h - N.
  *
- * Cesium reports camera and entity heights against the WGS84 ELLIPSOID, but a
- * viewer reads "ALT" as height above mean sea level — so over San Francisco
- * (N ≈ -32 m) a camera sitting 17 m above the SFO deck reports a startling
- * -15 m until the undulation is taken back out.
- *
- * Takes N as an argument instead of calling {@link geoidHeight} itself, so it
- * stays a pure function a display surface can call every tick against a cached
- * cell, and so it degrades safely: a non-finite N (grid still loading, or the
- * lazy import failed) returns the UNCORRECTED height rather than NaN — a
- * readout that is ~30 m off for a beat beats a readout that blanks.
- *
- * This converts the DATUM of a height that is ALREADY ellipsoidal. It must
- * never be applied to a barometric/aviation altitude: those are MSL-referenced
- * already, and subtracting N there would introduce the very error it removes
- * here, sign-flipped.
- *
  * @param {number} hEllipsoidalM - height above the WGS84 ellipsoid, in metres
  * @param {number|null|undefined} geoidUndulationM - N at that point, in metres
  * @returns {number} height above MSL in metres, or the input when N is unknown
@@ -96,4 +149,12 @@ export function ellipsoidalToMslDisplayM(hEllipsoidalM, geoidUndulationM) {
   if (!Number.isFinite(hEllipsoidalM)) return hEllipsoidalM;
   if (!Number.isFinite(geoidUndulationM)) return hEllipsoidalM;
   return hEllipsoidalM - geoidUndulationM;
+}
+
+export function ellipsoidToEgm96(latitude, longitude, altitude) {
+  return altitude - meanSeaLevel(latitude, longitude);
+}
+
+export function egm96ToEllipsoid(latitude, longitude, altitude) {
+  return altitude + meanSeaLevel(latitude, longitude);
 }
