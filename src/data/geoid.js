@@ -1,9 +1,9 @@
-// src/data/geoid.js — bundled EGM96 geoid-undulation lookup using static binary grid.
+// src/data/geoid.js ï¿½ bundled EGM96 geoid-undulation lookup using static binary grid.
 //
 // h = H + N: the globe (Cesium ellipsoid) needs ELLIPSOIDAL height (h);
 // most real-world elevation sources (barometric altitude, MSL survey data,
 // Caltrans/TfL camera priors) give ORTHOMETRIC height (H, "height above mean
-// sea level"). N is the local geoid undulation — the gap between the WGS84
+// sea level"). N is the local geoid undulation ï¿½ the gap between the WGS84
 // ellipsoid and the geoid (~mean sea level) surface, ranging roughly
 // -106..+85 m worldwide. See docs/plans/2026-07-05-entity-height-datum-fix.md.
 //
@@ -24,14 +24,23 @@ function degreesToRadians(degrees) {
 }
 
 function normalizeRadians(rads, center = 0) {
-  return rads - (2 * Math.PI) * Math.floor((rads + Math.PI - center) / (2 * Math.PI));
+  return (
+    rads - 2 * Math.PI * Math.floor((rads + Math.PI - center) / (2 * Math.PI))
+  );
 }
 
 function linearInterpolation(a, b, prop) {
   return a + (b - a) * prop;
 }
 
-function bilinearInterpolation(topLeft, bottomLeft, bottomRight, topRight, x, y) {
+function bilinearInterpolation(
+  topLeft,
+  bottomLeft,
+  bottomRight,
+  topRight,
+  x,
+  y,
+) {
   const top = linearInterpolation(topLeft, topRight, x);
   const bottom = linearInterpolation(bottomLeft, bottomRight, x);
   return linearInterpolation(top, bottom, y);
@@ -46,25 +55,23 @@ export async function ensureGeoidReady() {
   if (!readyPromise) {
     readyPromise = (async () => {
       let buffer;
-      if (typeof process !== 'undefined' && process.versions && process.versions.node && typeof window === 'undefined') {
+      const getBuiltinModule = globalThis.process?.getBuiltinModule;
+      if (typeof getBuiltinModule === 'function') {
         // Node.js runtime (unit tests)
-        const fs = await import('node:fs/promises');
-        const path = await import('node:path');
-        const url = await import('node:url');
-        let binPath;
-        try {
-          const __dirname = path.dirname(url.fileURLToPath(import.meta.url));
-          binPath = path.resolve(__dirname, '../../public/egm96.bin');
-        } catch {
-          binPath = path.resolve(process.cwd(), 'public/egm96.bin');
-        }
-        const fileBuf = await fs.readFile(binPath);
-        buffer = fileBuf.buffer.slice(fileBuf.byteOffset, fileBuf.byteOffset + fileBuf.byteLength);
+        const { readFileSync } = getBuiltinModule('node:fs');
+        const binUrl = new URL('../../public/egm96.bin', import.meta.url);
+        const fileBuf = readFileSync(binUrl);
+        buffer = fileBuf.buffer.slice(
+          fileBuf.byteOffset,
+          fileBuf.byteOffset + fileBuf.byteLength,
+        );
       } else {
         // Browser runtime (Vite web app)
         const response = await fetch('/egm96.bin');
         if (!response.ok) {
-          throw new Error(`Failed to load EGM96 geoid data asset: ${response.status} ${response.statusText}`);
+          throw new Error(
+            `Failed to load EGM96 geoid data asset: ${response.status} ${response.statusText}`,
+          );
         }
         buffer = await response.arrayBuffer();
       }
@@ -83,7 +90,7 @@ export async function ensureGeoidReady() {
 export function meanSeaLevel(latitude, longitude) {
   if (!dataView) {
     throw new Error(
-      'geoid.js: geoidHeight() called before ensureGeoidReady() resolved — ' +
+      'geoid.js: geoidHeight() called before ensureGeoidReady() resolved ï¿½ ' +
         'await ensureGeoidReady() first.',
     );
   }
@@ -93,25 +100,36 @@ export function meanSeaLevel(latitude, longitude) {
   }
   const lon = normalizeRadians(degreesToRadians(longitude));
 
-  let topRow = Math.floor(((Math.PI / 2) - lat) / INTERVAL);
+  let topRow = Math.floor((Math.PI / 2 - lat) / INTERVAL);
   topRow = topRow === NUM_ROWS - 1 ? topRow - 1 : topRow;
   const bottomRow = topRow + 1;
 
   const leftCol = Math.floor(normalizeRadians(lon, Math.PI) / INTERVAL);
   const rightCol = (leftCol + 1) % NUM_COLS;
 
-  const topLeft = dataView.getInt16((topRow * NUM_COLS + leftCol) * 2, false) / 100;
-  const bottomLeft = dataView.getInt16((bottomRow * NUM_COLS + leftCol) * 2, false) / 100;
-  const bottomRight = dataView.getInt16((bottomRow * NUM_COLS + rightCol) * 2, false) / 100;
-  const topRight = dataView.getInt16((topRow * NUM_COLS + rightCol) * 2, false) / 100;
+  const topLeft =
+    dataView.getInt16((topRow * NUM_COLS + leftCol) * 2, false) / 100;
+  const bottomLeft =
+    dataView.getInt16((bottomRow * NUM_COLS + leftCol) * 2, false) / 100;
+  const bottomRight =
+    dataView.getInt16((bottomRow * NUM_COLS + rightCol) * 2, false) / 100;
+  const topRight =
+    dataView.getInt16((topRow * NUM_COLS + rightCol) * 2, false) / 100;
 
   const lonLeft = normalizeRadians(leftCol * INTERVAL);
-  const latTop = (Math.PI / 2) - (topRow * INTERVAL);
+  const latTop = Math.PI / 2 - topRow * INTERVAL;
 
   const leftProp = (lon - lonLeft) / INTERVAL;
   const topProp = (latTop - lat) / INTERVAL;
 
-  return bilinearInterpolation(topLeft, bottomLeft, bottomRight, topRight, leftProp, topProp);
+  return bilinearInterpolation(
+    topLeft,
+    bottomLeft,
+    bottomRight,
+    topRight,
+    leftProp,
+    topProp,
+  );
 }
 
 /**
